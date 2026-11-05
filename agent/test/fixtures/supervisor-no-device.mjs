@@ -12,5 +12,7 @@ const replacement = `
 `;
 registerHooks({ load(url, context, nextLoad) {
   if (url.endsWith('/agent/poki-client.mjs')) return { format: 'module', source: replacement, shortCircuit: true };
-  return nextLoad(url, context);
+  const loaded = nextLoad(url, context);
+  if (url.endsWith('/agent/scripts/self-chat.mjs')) return { ...loaded, source: String(loaded.source).replace("for (const name of ['poki-native', 'ocr']) await access(resolve('build', name), constants.X_OK);", "/* Native file checks are supplied by this synthetic supervisor fixture. */") };
+  return loaded;
 } });

@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
+  echo 'Release packages require an Apple Silicon Mac with full Xcode.' >&2; exit 1
+fi
+./bin/setup
+npm ci --prefix agent --no-audit --no-fund
+package_version=$(node -p "require('./package.json').version")
+package_name="poki-optimized-v${package_version}-macos-arm64"
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT HUP INT TERM
+mkdir -p "$stage/$package_name"
+# Include current source changes, but never credentials, sessions, pairing or caches.
+git ls-files -z --cached --others --exclude-standard | tar --null -T - -cf "$stage/source.tar"
+tar -xf "$stage/source.tar" -C "$stage/$package_name"
+for executable in build/poki-native build/ocr build/simulator build/native-target/release/examples/unlock_iphone .deps/idevice/target/release/idevice-tools .deps/idevice/target/release/idevice_id; do
+  test -x "$executable"
+  mkdir -p "$stage/$package_name/$(dirname "$executable")"
+  cp "$executable" "$stage/$package_name/$executable"
+done
+mkdir -p build/releases
+tar -czf "build/releases/$package_name.tar.gz" -C "$stage" "$package_name"
+shasum -a 256 "build/releases/$package_name.tar.gz" > "build/releases/$package_name.tar.gz.sha256"
+echo "build/releases/$package_name.tar.gz"

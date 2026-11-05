@@ -282,7 +282,8 @@ test('bin/setup says what to install for a missing prerequisite', { timeout: 200
   for (const [missing, install] of [['xcodebuild', /full Xcode/], ['node', /Node\.js 24/], ['cargo', /rustup\.rs/], ['ffmpeg', /brew install ffmpeg/]]) {
     const bin = join(dir, missing);
     await mkdir(bin);
-    for (const tool of ['uname', 'dirname']) await symlink(`/usr/bin/${tool}`, join(bin, tool));
+    await writeFile(join(bin, 'uname'), '#!/bin/sh\necho Darwin\n', { mode: 0o755 });
+    for (const tool of ['dirname']) await symlink(`/usr/bin/${tool}`, join(bin, tool));
     for (const tool of present.filter(tool => tool !== missing)) await writeFile(join(bin, tool), '', { mode: 0o755 });
     const setup = spawnSync(join(root, 'bin/setup'), { env: { PATH: bin }, encoding: 'utf8' });
     assert.equal(setup.status, 1, missing);

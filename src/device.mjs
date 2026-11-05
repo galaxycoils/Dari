@@ -14,6 +14,10 @@ import { askHuman } from './human.mjs';
 import { simulatorRequest } from './simulator.mjs';
 import { prepareRecordingInput, resumeRecordings } from './recording.mjs';
 import { version, buildInfo, requireCurrentCode } from './build-info.mjs';
+import { optimized, executionMode } from './execution-mode.mjs';
+import { NativeWorker } from './native-worker.mjs';
+import { FrameCache } from './frame-cache.mjs';
+import { prepareFrame, frameJpeg, accountFrame } from './frame-processing.mjs';
 
 export const text = value => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] });
 const usedSimulators = new Set();
@@ -37,6 +41,7 @@ export function hidPoint(x, y, width, height) {
 
 export class Devices {
   selected; requested; frame; size; seen; elements = []; elementsAt = 0; lastInputAt = -Infinity; inBatch = false;
+  workers = new Map(); imageCaches = new Map();
   scales = new Map(); physicalNames = new Map(); backgroundDevices = new Map(); nextRef = 0;
   constructor(coordinator = new Coordination()) { this.coordinator = coordinator; }
   async run(file, args, timeout = 45000, input) {
@@ -45,6 +50,9 @@ export class Devices {
   }
   async cleanup(onlyDevices) {
     const result = await closePlatform(this, onlyDevices);
+    for (const [id, cache] of this.imageCaches) if (!onlyDevices || onlyDevices.has(id)) { cache.clear(); this.imageCaches.delete(id); }
+    await Promise.all([...this.workers].filter(([id]) => !onlyDevices || onlyDevices.has(id)).map(async ([id, worker]) => { await worker.close(); this.workers.delete(id);
+      if (this.coordinator.nativeWorkers?.get(id)?.worker === worker) this.coordinator.nativeWorkers.delete(id); }));
     if (onlyDevices) for (const id of onlyDevices) this.backgroundDevices.delete(id);
     else this.backgroundDevices.clear();
     if (!onlyDevices || onlyDevices.has(this.frame?.device)) { this.frame = undefined; this.elements = []; }
@@ -140,8 +148,29 @@ export class Devices {
     const target = await this.target();
     if (target.kind === 'simulator') return simulatorRequest(target.id, request);
     const nativeRequest = request.op === 'ax' ? { op: 'ax_tree', include_offscreen: request.include_offscreen ?? false } : request;
-    const { stdout } = await this.run(join(root, 'build/poki-native'), ['--udid', target.id], 95000, JSON.stringify(nativeRequest));
-    const result = JSON.parse(stdout);
+    let result;
+    if (optimized) {
+      const shared = this.coordinator.nativeWorkers ??= new Map();
+      const active = shared.get(target.id);
+      if (active && active.owner !== this) {
+        // Coordination serializes operations; retire the previous media session
+        // completely before another MCP client creates one for the same phone.
+        await active.worker.close();
+        active.owner.workers.delete(target.id);
+        active.owner.changed(target);
+        shared.delete(target.id);
+      }
+      let worker = this.workers.get(target.id);
+      if (!worker || worker.closed) {
+        worker = await phase('native_worker_start', () => new NativeWorker(join(root, 'build/poki-native'), target.id));
+        this.workers.set(target.id, worker);
+        shared.set(target.id, { owner: this, worker });
+      }
+      result = await worker.call(nativeRequest);
+    } else {
+      const { stdout } = await this.run(join(root, 'build/poki-native'), ['--udid', target.id], 95000, JSON.stringify(nativeRequest));
+      result = JSON.parse(stdout);
+    }
     if (request.op === 'ax') return { ...result, foreground: result.foreground_app, elements: result.elements?.map(e => ({ ...e, type: e.type ?? e.role })) };
     return result;
   }
@@ -164,23 +193,41 @@ export class Devices {
     const started = new Date().toISOString();
     const target = await this.target();
     const cache = join(stateDir, 'frames');
-    await mkdir(cache, { recursive: true, mode: 0o700 });
+    let temporary = false;
     const path = join(cache, `${randomUUID()}.png`);
     try {
       // Unmasked, the area around the Dynamic Island differs between frames of a still screen, which would expire refs.
-      if (target.kind === 'simulator') await this.run('xcrun', ['simctl', 'io', target.id, 'screenshot', '--type=png', '--mask=black', path]);
+      let captured;
+      if (optimized && target.kind === 'physical') {
+        try { const result = await this.bridge({ op: 'screenshot' }); captured = Buffer.from(result.png_base64, 'base64'); if (!captured.length) throw new Error('Empty screenshot'); }
+        catch (error) { if (stopped(error)) throw error; /* Read-only capture can safely fall back. */ }
+      }
+      if (!captured) {
+        await mkdir(cache, { recursive: true, mode: 0o700 }); temporary = true;
+      }
+      if (captured) { /* Keep the lossless bytes in memory. */ }
+      else if (target.kind === 'simulator') await this.run('xcrun', ['simctl', 'io', target.id, 'screenshot', '--type=png', '--mask=black', path]);
       else await this.native(['screenshot', path], /Screenshot saved to:/);
-      const original = await readFile(path), meta = await sharp(original).metadata();
+      const original = captured ?? await readFile(path);
       const scale = await this.scale(target);
-      const width = Math.round(meta.width / scale), height = Math.round(meta.height / scale);
-      const data = await sharp(original).resize(width, height).png().toBuffer();
-      this.coordinator.observeFrame(target.id, data);
+      let data, derived, pixelHash, cacheKey, width, height;
+      if (optimized) {
+        let cache = this.imageCaches.get(target.id);
+        if (!cache) { cache = new FrameCache(); this.imageCaches.set(target.id, cache); }
+        ({ derived } = await phase('image_processing', () => prepareFrame(original, scale, this.workers.get(target.id)?.generation ?? 'simulator', cache)));
+        ({ data, pixelHash, cacheKey, width, height } = derived);
+      } else {
+        const meta = await sharp(original).metadata();
+        width = Math.round(meta.width / scale); height = Math.round(meta.height / scale);
+        data = await sharp(original).resize(width, height).png().toBuffer();
+      }
+      this.coordinator.observeFrame(target.id, optimized ? Buffer.from(pixelHash, 'hex') : data);
       if (this.frame?.revision !== this.coordinator.revision(target.id) || this.frame?.device !== target.id || this.frame?.width !== width || this.frame?.height !== height || !this.frame.data.equals(data)) { this.elements=[]; this.elementsAt=0; }
       checkWork();
-      this.frame = { id: randomUUID(), device: target.id, revision: this.coordinator.revision(target.id), width, height, scale, data, original, at: Date.now(), capture_started_at: started, capture_completed_at: new Date().toISOString() };
+      this.frame = { id: randomUUID(), device: target.id, revision: this.coordinator.revision(target.id), width, height, scale, data, original, derived, pixelHash, cacheKey, at: Date.now(), capture_started_at: started, capture_completed_at: new Date().toISOString() };
       this.size = { device: target.id, width, height };
       return this.frame;
-    } finally { await unlink(path).catch(() => {}); }
+    } finally { if (temporary) await unlink(path).catch(() => {}); }
   }
   async viewport() {
     const target = await this.target();
@@ -190,9 +237,23 @@ export class Devices {
   }
   async ocr(frame) {
     checkWork();
+    if (frame.derived) {
+      const result = frame.derived.ocr ??= phase('ocr', () => this.readOCR(frame));
+      try {
+        const elements = await result;
+        frame.derived.ocrBytes ??= Buffer.byteLength(JSON.stringify(elements));
+        const cache = this.imageCaches.get(frame.device);
+        if (cache) accountFrame(cache, frame.derived);
+        return elements;
+      } catch (error) { delete frame.derived.ocr; throw error; }
+    }
     return frame.ocr ??= phase('ocr', () => this.readOCR(frame));
   }
   async readOCR(frame) {
+    if (optimized) {
+      const { stdout } = await this.run(join(root, 'build/ocr'), ['-'], 45000, frame.data);
+      return JSON.parse(stdout).map(e => ({ ...e, label: e.text, type: 'StaticText', frame: { x:e.x,y:e.y,width:e.width,height:e.height } }));
+    }
     const file = join(stateDir, 'frames', `${randomUUID()}-ocr.png`);
     try {
       await writeFile(file, frame.data, { mode: 0o600 });
@@ -200,13 +261,13 @@ export class Devices {
       return JSON.parse(stdout).map(e => ({ ...e, label: e.text, type: 'StaticText', frame: { x:e.x,y:e.y,width:e.width,height:e.height } }));
     } finally { await unlink(file).catch(() => {}); }
   }
-  async recognize(args = {}, existingFrame) {
+  async recognize(args = {}, existingFrame, existingStructure) {
     checkWork();
     const frame = existingFrame ?? await this.capture();
     let elements, source, foreground, nativeError;
     if (args.source !== 'ocr') {
       try {
-        const tree = await phase('accessibility', () => this.bridge({ op: 'ax', include_offscreen: args.include_offscreen ?? false }));
+        const tree = (existingStructure?.worker_generation === (this.workers.get(frame.device)?.generation ?? null) ? existingStructure : undefined) ?? await phase('accessibility', () => this.bridge({ op: 'ax', include_offscreen: args.include_offscreen ?? false }));
         if (!Array.isArray(tree.elements) || !tree.elements.length) throw new Error('No accessibility elements returned');
         elements = tree.elements; source = 'accessibility'; foreground = tree.foreground;
       } catch (error) { if (stopped(error)) throw error; nativeError = error.message; if (args.source === 'accessibility' || args.source === 'ax') throw error; }
@@ -219,7 +280,7 @@ export class Devices {
     const count = elements.length;
     this.elements = elements.slice(0, args.max_elements ?? 400).map(e => ({ ...e, ref:`e${++this.nextRef}` }));
     this.elementsAt = Date.now();
-    frame.structure_completed_at = new Date().toISOString();
+    frame.structure_completed_at = existingStructure?.structure_completed_at ?? new Date().toISOString();
     frame.source = source;
     const observation = this.observation(frame);
     return { observation, source, width: frame.width, height: frame.height, units: 'points', foreground, elements: this.elements, total: count, truncated: count > this.elements.length, ...(source === 'ocr' && nativeError ? { fallback_reason: nativeError } : {}) };
@@ -232,7 +293,7 @@ export class Devices {
     const elements = (tree.elements ?? []).filter(onScreen(this.size?.device === target.id ? this.size : await this.capture()));
     // A tree that leaves a state out compares equal to one that gives its default.
     const signature = JSON.stringify(elements.map(e => { const box = e.frame ?? e; return [e.type ?? e.role, e.label, e.text, e.value, e.focused, Boolean(e.selected), Boolean(e.enabled ?? true), box.x, box.y, box.width, box.height]; }));
-    return this.seen = { device: target.id, foreground: tree.foreground, elements, signature, at: performance.now() };
+    return this.seen = { device: target.id, foreground: tree.foreground, elements, signature, structure_completed_at: new Date().toISOString(), worker_generation: this.workers.get(target.id)?.generation ?? null, at: performance.now() };
   }
   // A simulator's size only changes when it rotates. A physical device maps touches through its
   // current orientation, so it keeps taking a fresh frame.
@@ -246,7 +307,17 @@ export class Devices {
     try {
       const { signature, screen } = await deadline(readbackMs, () => readScreen(this));
       const compared = before !== undefined && signature !== undefined;
-      return { screen, screen_change_verified: compared, ...(compared ? { screen_changed: signature !== before } : {}) };
+      let structuredObservation;
+      if (optimized && this.seen?.elements.length && this.seen.device === (await this.target()).id) {
+        // Capture after stabilization, then use this operation's final tree. Timestamps explicitly remain non-atomic.
+        try {
+          structuredObservation = await deadline(readbackMs, async () => {
+            const frame = await this.capture();
+            return this.recognize({ source: 'accessibility' }, frame, this.seen);
+          });
+        } catch { checkWork(); /* Preserve the action and legacy readback if optional evidence fails. */ }
+      }
+      return { screen, ...(structuredObservation ? { structuredObservation } : {}), screen_change_verified: compared, ...(compared ? { screen_changed: signature !== before } : {}) };
     } catch (error) {
       try { checkWork(); } catch (stop) { return { stopped: true, stop_reason: stoppingReason(stop) }; }
       return { screen_change_verified: false, screen: { unavailable: error.message } };
@@ -272,7 +343,7 @@ export class Devices {
     if (remaining > 0) await pause(remaining);
   }
   observation(frame = this.frame) {
-    return { id: frame.id, device: frame.device, width: frame.width, height: frame.height, units: 'points', capture_started_at: frame.capture_started_at, capture_completed_at: frame.capture_completed_at, structure_completed_at: frame.structure_completed_at, structure_source: frame.source ?? null, atomic: false, revision: frame.revision };
+    return { id: frame.id, device: frame.device, width: frame.width, height: frame.height, units: 'points', capture_started_at: frame.capture_started_at, capture_completed_at: frame.capture_completed_at, structure_completed_at: frame.structure_completed_at, structure_source: frame.source ?? null, worker_generation: this.workers.get(frame.device)?.generation ?? null, atomic: false, revision: frame.revision };
   }
   async input(request) {
     const target = await this.target();
@@ -329,7 +400,7 @@ export class Devices {
       }
       switch (name) {
         case 'acquire_device': return text(await this.coordinator.acquire(this, await this.target(false), args.ttl_seconds ?? 120));
-        case 'poki_mcp_status': return text({ implementation: `Poki MCP ${version}`, ...await buildInfo(), registered_device_tools: 50, observation_tools: 1, management_tools: 4, total_tools: definitions.length, devices: (await this.inventory()).length, selected: this.selected ?? null, approval_mode: process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? 'operator-preapproved' : 'ask-human' });
+        case 'poki_mcp_status': return text({ implementation: `Poki MCP ${version}`, execution_mode: executionMode, ...await buildInfo(), registered_device_tools: 50, observation_tools: 1, management_tools: 4, total_tools: definitions.length, devices: (await this.inventory()).length, selected: this.selected ?? null, approval_mode: process.env.POKI_MCP_APPROVAL_MODE === 'allow' ? 'operator-preapproved' : 'ask-human' });
         case 'list_devices': return text({ devices: await this.describeDevices(args.include_all_simulators), ...(args.include_all_simulators ? { simulator_models: await simulatorModels() } : {}) });
         case 'select_device': {
           this.requested = args.device;
@@ -350,7 +421,8 @@ export class Devices {
         case 'take_screenshot': {
           const frame = await this.capture();
           const width = Math.round(args.max_width ?? frame.width);
-          const jpeg = await sharp(frame.data).resize({ width }).jpeg({ quality: 90 }).toBuffer();
+          const jpeg = frame.derived ? await frameJpeg(frame.derived, width, this.imageCaches.get(frame.device))
+            : await sharp(frame.data).resize({ width }).jpeg({ quality: 90 }).toBuffer();
           let prompt;
           try { prompt = { status:'checked', source:'ocr', warning:promptWarning(await this.ocr(frame)) }; }
           catch (error) { if (stopped(error)) throw error; prompt = { status:'unavailable', instruction:'Inspect the screenshot for system prompts before continuing.' }; }
@@ -417,7 +489,8 @@ export class Devices {
           if (name === 'request_human_action') return { ...(result.completed ? {} : { isError: true, _meta: { stop_reason: 'error' } }), ...text(result) };
           if (result.stopped || result.isError) return { isError: true, ...text(result), _meta: { stop_reason: result.stop_reason ?? (result.stopped ? 'cancelled' : 'unknown') } };
           if (name === 'wait_for') return { content: [...text(result).content, { type: 'image', data: this.frame.data.toString('base64'), mimeType: 'image/png' }] };
-          return { ...text(result), ...(unchanged ? { _meta: { stop_reason: 'no_change' } } : {}) };
+          const { structuredObservation, ...legacyResult } = result;
+          return { ...text(legacyResult), ...(structuredObservation ? { structuredContent: { observation: structuredObservation } } : {}), ...(unchanged ? { _meta: { stop_reason: 'no_change' } } : {}) };
         }
       }
     } finally { this.requested=previous; if (!sharesTarget) this.resolved=previousResolved; }

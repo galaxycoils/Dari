@@ -76,14 +76,16 @@ export async function runBatch(ctx, args) {
     }
   } finally { ctx.inBatch = false; }
   const summary = {};
+  let structuredObservation;
   // Reading a simulator that a step just shut down would boot it again.
   const last = commands.slice(0, ran).findLast(command => !offDevice.has(command.tool));
   if (last && last.tool !== 'shut_down_simulator') {
     // dispatch restores both when this batch ends.
     if (last.arguments?.device) { ctx.requested = last.arguments.device; ctx.resolved = undefined; }
-    const { screen, stop_reason } = await phase('batch_readback', () => ctx.readback());
+    const { screen, stop_reason, structuredObservation: observed } = await phase('batch_readback', () => ctx.readback());
     stopReason ??= stop_reason;
     summary.screen = screen;
+    structuredObservation = observed;
   }
   if (stopReason) {
     if (failure) {
@@ -101,5 +103,5 @@ export async function runBatch(ctx, args) {
     else if (unchanged) Object.assign(summary, { unchanged_step: unchanged, remaining_steps: commands.slice(ran), next: advice(stopReason, ran) });
     else Object.assign(summary, { remaining_steps: commands.slice(ran), next: advice(stopReason, ran + 1) });
   }
-  return { ...(failed || stopReason ? { isError: true } : {}), content: [...blocks, receipt({ completed_steps: ran, stop_reason: stopReason ?? null, ...summary })] };
+  return { ...(structuredObservation ? { structuredContent: { observation: structuredObservation } } : {}), ...(failed || stopReason ? { isError: true } : {}), content: [...blocks, receipt({ completed_steps: ran, stop_reason: stopReason ?? null, ...summary })] };
 }

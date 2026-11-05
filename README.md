@@ -1,3 +1,12 @@
+# Poki Optimized
+
+Compatible performance fork of [JosssphZhou/poki](https://github.com/JosssphZhou/poki).
+See [optimization setup, validation and benchmarks](docs/optimization.md).
+Optimized execution is opt-in; physical-device speed and reliability acceptance is pending.
+Original AGPL-3.0-only license, copyright and acknowledgments are retained below.
+
+---
+
 <p align="center">
   <img src="docs/images/poki-icon.png" width="72" height="72" alt="Poki icon">
 </p>

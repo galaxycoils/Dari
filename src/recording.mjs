@@ -72,6 +72,7 @@ async function recover(session, requestSignal, automatic = false) {
   try { await session.recovery; } finally { session.recovery = undefined; }
 }
 export async function startRecording(ctx, target) {
+  if (ctx.workers?.has(target.id)) { await ctx.workers.get(target.id).close(); ctx.workers.delete(target.id); }
   checkWork();
   const active = recordings(ctx);
   if (active.has(target.id)) throw new Error('This device is already recording. Call stop_recording first.');
@@ -110,6 +111,9 @@ export async function prepareRecordingInput(ctx, target) {
   catch (error) { session.inputPending = false; throw error; }
 }
 export async function resumeRecordings(ctx, target) {
+  if (recordings(ctx).has(target.id) && ctx.workers?.has(target.id)) {
+    await ctx.workers.get(target.id).close(); ctx.workers.delete(target.id);
+  }
   const session = recordings(ctx).get(target.id);
   if (!session || target.kind === 'simulator') return;
   try { checkWork(); await recover(session, signal()); }

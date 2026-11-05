@@ -14,6 +14,7 @@ import { openingSentence, openingFromPrompt } from './opening.mjs';
 import { unlockDevice } from './unlock-device.mjs';
 import { StepDeadline } from './step-deadline.mjs';
 import { checkDeviceTools } from './device-preflight.mjs';
+import { validReceiptObservation } from '../src/observation-receipt.mjs';
 
 const terminal = new Set(['completed', 'failed', 'stopped']);
 const allowedTools = new Set(['poki_mcp_status', 'get_foreground_app', 'list_apps', 'launch_app', 'take_screenshot', 'observe_device', 'list_elements', 'tap', 'tap_text', 'fill', 'type_text', 'press_key', 'hide_keyboard', 'scroll', 'swipe', 'go_back', 'handle_alert', 'batch_commands']);
@@ -143,10 +144,6 @@ export class PhoneTask extends EventEmitter {
         this.initialForeground = resultData(foreground);
       } catch (error) { this.#restoreWarning(error); }
       if (this.finished) return;
-      const modelStarted = performance.now();
-      await this.codex.open();
-      if (this.finished) { this.codex.close(); return; }
-      this.snapshot.metrics.modelSetupMilliseconds = performance.now() - modelStarted;
       let route = this.options.images?.length ? null : await this.routes.find(this.snapshot.prompt, this.snapshot.context);
       if (route) {
         await this.#announce(this.routes.render(route.opening, route.plan.texts));
@@ -209,6 +206,10 @@ export class PhoneTask extends EventEmitter {
   }
 
   async #startModel(definitions) {
+    const modelStarted = performance.now();
+    await this.codex.open();
+    if (this.finished) { this.codex.close(); return; }
+    this.snapshot.metrics.modelSetupMilliseconds = performance.now() - modelStarted;
     this.modelStarted = performance.now();
     this.modelToolMilliseconds = this.snapshot.metrics.toolMilliseconds;
     const instructions = [this.poki.instructions, await readFile(new URL('./skills/iphone-unlock/SKILL.md', import.meta.url), 'utf8'), await readFile(new URL('./prompts/call-draft.md', import.meta.url), 'utf8'), await readFile(new URL('./prompts/pi-app.md', import.meta.url), 'utf8')].join('\n\n');
@@ -416,7 +417,9 @@ export class PhoneTask extends EventEmitter {
     if (this.observedAfterAction && ['batch_commands', 'take_screenshot', 'observe_device', 'list_elements'].includes(name)) this.completionEvidence = result.content;
     this.#record(name, args, result);
     if (!observing && !result.isError) {
-      const observed = await this.#completeObservation();
+      const receipt = validReceiptObservation(result, this.device);
+      const observed = receipt ? { content: [{ type: 'text', text: JSON.stringify(receipt) }] } : await this.#completeObservation();
+      if (receipt) { this.trace.push({ tool: 'list_elements', args: { device: this.device }, result: receipt, error: false, at: new Date().toISOString() }); }
       if (observed) {
         result = { ...result, content: [...result.content, ...observed.content] };
         if (!observed.isError) { this.observedAfterAction = true; this.completionEvidence = observed.content; }
