@@ -13,7 +13,7 @@ import { interaction, promptWarning, readScreen, screenChanged, justReadMs } fro
 import { askHuman } from './human.mjs';
 import { simulatorRequest } from './simulator.mjs';
 import { prepareRecordingInput, resumeRecordings } from './recording.mjs';
-import { version, buildInfo } from './build-info.mjs';
+import { version, buildInfo, requireCurrentCode } from './build-info.mjs';
 import { optimized, executionMode } from './execution-mode.mjs';
 import { NativeWorker } from './native-worker.mjs';
 import { FrameCache } from './frame-cache.mjs';
@@ -385,6 +385,7 @@ export class Devices {
     this.requested = args.device ?? previous;
     try {
       checkWork();
+      if (name !== 'poki_mcp_status' && name !== 'stop_recording') await requireCurrentCode();
       if (approvedTools.has(name)) await this.target();
       if (approvedTools.has(name) && process.env.POKI_MCP_APPROVAL_MODE !== 'allow') {
         const detail = args.path ?? args.project_path ?? args.bundle_id ?? args.url ?? (name === 'set_clipboard' ? `${Buffer.byteLength(args.text)} 字节的文本` : '');
