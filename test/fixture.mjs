@@ -24,7 +24,24 @@ import { createInterface } from 'node:readline';
 const args=process.argv.slice(2), tool=basename(process.argv[1]), state=JSON.parse(readFileSync(process.env.FIXTURE_STATE));
 const log=(event)=>appendFileSync(process.env.FIXTURE_LOG,JSON.stringify(event)+'\\n');
 log({tool,args,pid:process.pid});
-if(tool==='python3') console.log(JSON.stringify(state.simulatorOnly?[]:state.twoPhones?[{id:'fixture-phone',connection:'USB'},{id:'fixture-phone-2',connection:'USB'}]:[{id:'fixture-phone',connection:'USB'}]));
+if(tool==='poki-native'&&args.includes('--worker')) {
+ for await(const line of createInterface({input:process.stdin})) {
+  const {id,request}=JSON.parse(line);
+  try {
+   const result=request.op==='screenshot'?{png_base64:readFileSync(process.env.FIXTURE_IMAGE).toString('base64')}:JSON.parse(execFileSync(process.execPath,[process.argv[1],...args.filter(a=>a!=='--worker')],{input:JSON.stringify(request)}));
+   console.log(JSON.stringify({id,result}));
+  } catch {console.log(JSON.stringify({id,error:'Fixture operation failed'}));}
+ }
+}
+else if(tool==='plutil') {
+ const code='import sys,json,plistlib; a=sys.argv[1:]; data=sys.stdin.buffer.read() if a[-1]=="-" else open(a[-1],"rb").read(); v=json.loads(data) if data.lstrip().startswith(b"{") else plistlib.loads(data); sys.stdout.buffer.write(str(v[a[1]]).encode() if "-extract" in a else json.dumps(v).encode() if "json" in a else plistlib.dumps(v))';
+ process.stdout.write(execFileSync(process.env.FIXTURE_PYTHON, ['-c',code,...args], {input:args.at(-1)==='-'?await new Promise(r=>{let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>r(s));}):undefined}));
+}
+else if(tool==='ditto') {
+ const code='import os,sys,zipfile; source,dest=sys.argv[1:]; z=zipfile.ZipFile(dest,"w"); [(z.write(os.path.join(d,f),os.path.relpath(os.path.join(d,f),os.path.dirname(source)))) for d,_,fs in os.walk(source) for f in fs]; z.close()';
+ execFileSync(process.env.FIXTURE_PYTHON,['-c',code,...args.slice(-2)]);
+}
+else if(tool==='python3') console.log(JSON.stringify(state.simulatorOnly?[]:state.twoPhones?[{id:'fixture-phone',connection:'USB'},{id:'fixture-phone-2',connection:'USB'}]:[{id:'fixture-phone',connection:'USB'}]));
 else if(tool==='xcrun') {if(args.includes('listapps')){console.log('<?xml version="1.0"?><plist version="1.0"><dict><key>local.fixture</key><dict><key>CFBundleName</key><string>Fixture</string></dict></dict></plist>');process.exit(0);}if(args.includes('launch')){console.log('local.fixture: 4242');process.exit(0);}if(args.includes('keyboard')){writeFileSync(process.env.FIXTURE_STATE,JSON.stringify({...state,keyboard:args.at(-1)}));process.exit(0);}if(args.includes('screenshot')){copyFileSync(process.env.FIXTURE_IMAGE,args.at(-1));process.exit(0);}if(args.includes('devicectl')&&args.includes('copy')){if(state.denyContainer){console.error('Container access denied by device');process.exit(1);}const destination=args[args.indexOf('--destination')+1];mkdirSync(destination+'/Documents',{recursive:true});writeFileSync(destination+'/Documents/check.txt','fixture container contents');console.log(JSON.stringify({info:{outcome:'success'},result:{}}));process.exit(0);}if(state.coreDeviceUnavailable&&args.includes('devicectl')){console.error('ERROR: The specified device was not found. (com.apple.dt.CoreDeviceError error 1000)');process.exit(1);} console.log(JSON.stringify({devices:state.simulatorOnly?{'com.apple.CoreSimulator.SimRuntime.iOS-27-0':[{udid:'fixture-sim',name:'Fixture Simulator',state:state.simulatorBooted?'Booted':'Shutdown',dataPath:process.env.HOME+'/simulator'},...(state.secondSimulator?[{udid:'fixture-sim-2',name:'Second Simulator',state:'Booted',dataPath:process.env.HOME+'/simulator-2'}]:[])]}:{}}));}
 else if(tool==='idevice') {
  if(args.includes('screenshot')) {if(state.screenshotUnavailable){console.error('Screenshot service unavailable');process.exit(1);}copyFileSync(process.env.FIXTURE_IMAGE,args.at(-1));console.log('Screenshot saved to: fixture');}
@@ -82,7 +99,7 @@ else if(tool==='osascript') {log({dialog:true});setInterval(()=>{},10000);}
 else throw Error('Unexpected fixture command '+tool);
 `;
 export const value = result => JSON.parse(result.content.find(c => c.type === 'text').text);
-export async function fixture(t, { approvalMode = 'ask', staleNative = false, toolsProfile = '' } = {}) {
+export async function fixture(t, { approvalMode = 'ask', staleNative = false, toolsProfile = '', executionMode = 'legacy' } = {}) {
  const dir=await mkdtemp(join(tmpdir(),'poki-coordination-'));
  await cp(join(root,'src'),join(dir,'src'),{recursive:true});
  await cp(join(root,'package.json'),join(dir,'package.json'));
@@ -90,10 +107,10 @@ export async function fixture(t, { approvalMode = 'ask', staleNative = false, to
  await mkdir(join(dir,'build'));await mkdir(join(dir,'bin'));await mkdir(join(dir,'native'));
  const image=join(dir,'image.png');await sharp({create:{width:100,height:200,channels:3,background:'white'}}).png().toFile(image);
  const state=join(dir,'fixture.json'),log=join(dir,'commands.jsonl');await writeFile(state,'{}');await writeFile(log,'');
- for(const tool of ['python3','xcrun','idevice','ffmpeg','ffprobe','osascript'])await writeFile(join(dir,'bin',tool),fixtureProgram,{mode:0o755});
+ for(const tool of ['python3','xcrun','idevice','ffmpeg','ffprobe','osascript','plutil','ditto'])await writeFile(join(dir,'bin',tool),fixtureProgram,{mode:0o755});
  for(const tool of ['poki-native','ocr','simulator'])await writeFile(join(dir,'build',tool),fixtureProgram,{mode:0o755});
  if(staleNative){await mkdir(join(dir,'native/bridge/src'),{recursive:true});await writeFile(join(dir,'native/bridge/src/main.rs'),'fn main() {}');await utimes(join(dir,'build/poki-native'),1,1);}
- const env={...process.env,POKI_MCP_TOOLS:toolsProfile,POKI_MCP_APPROVAL_MODE:approvalMode,HOME:dir,PATH:join(dir,'bin')+':'+process.env.PATH,POKI_MCP_STATE_DIR:join(dir,'state'),IDEVICE_TOOLS:join(dir,'bin/idevice'),FIXTURE_STATE:state,FIXTURE_LOG:log,FIXTURE_IMAGE:image};
+ const env={...process.env,POKI_MCP_EXECUTION_MODE:executionMode,FIXTURE_PYTHON:process.env.FIXTURE_PYTHON ?? '/usr/bin/python3',POKI_MCP_TOOLS:toolsProfile,POKI_MCP_APPROVAL_MODE:approvalMode,HOME:dir,PATH:join(dir,'bin')+':'+process.env.PATH,POKI_MCP_STATE_DIR:join(dir,'state'),IDEVICE_TOOLS:join(dir,'bin/idevice'),FIXTURE_STATE:state,FIXTURE_LOG:log,FIXTURE_IMAGE:image};
  let stderr='';
  const daemons=[];
  const startDaemon=async(port=0)=>{const child=spawn(process.execPath,[join(dir,'src/daemon.mjs'),'--port',String(port)],{env,stdio:['ignore','pipe',staleNative?'pipe':'inherit']});child.stderr?.on('data',chunk=>{stderr+=chunk;});const exited=once(child,'exit'),lines=createInterface({input:child.stdout});await once(lines,'line');const running={stop:async(signal='SIGTERM')=>{child.kill(signal);await exited;lines.close();}};daemons.push(running);return running;};

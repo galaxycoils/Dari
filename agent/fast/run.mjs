@@ -10,7 +10,7 @@ export async function runFast({ task, alternatives = [], onSelect = () => {}, ca
   const stats = { mode, provider: null, model: null, model_calls: 0, model_ms: 0, tool_calls: 0, tool_ms: 0, scope_ms: 0, action_count: 0, scope_launch_count: 0, total_ms: 0 };
   let session, lease, observation, lastAction, pending = false, reason = null, status = 'handoff';
   const history = [], observedIds = new Set();
-  let scopePid;
+  let scopePid, receiptObservation;
   const checkpoint = () => ({
     bundle_id: task.bundle_id, completed_action_ids: history.slice(),
     last_action_id: lastAction ?? null, action_outcome: pending ? 'unknown' : lastAction ? 'acknowledged' : 'none',
@@ -49,12 +49,13 @@ export async function runFast({ task, alternatives = [], onSelect = () => {}, ca
     for (;;) {
       signal.throwIfAborted();
       await session.call('renew_device', { lease_id: lease.lease_id, ttl_seconds: 300 });
-      const current = await session.call('observe_device', { device: task.device, source: 'auto', max_elements: 400, include_offscreen: false });
+      const current = receiptObservation ?? await session.call('observe_device', { device: task.device, source: 'auto', max_elements: 400, include_offscreen: false });
       if (!current.observation?.id || current.observation.device !== lease.device || observedIds.has(current.observation.id)
         || !Array.isArray(current.elements) || !current.elements.length || current.truncated
         || !['accessibility', 'ocr'].includes(current.source)
         || current.elements.some(e => typeof e.ref !== 'string' || !/^e\d+$/.test(e.ref))
         || new Set(current.elements.map(e => e.ref)).size !== current.elements.length) throw new Error('structure_unavailable');
+      receiptObservation = undefined;
       observation = current; observedIds.add(current.observation.id); fresh();
       if (current.foreground) verifyScope(current.foreground);
       else await scope();
@@ -78,6 +79,7 @@ export async function runFast({ task, alternatives = [], onSelect = () => {}, ca
         ...(action.ref ? { ref: action.ref } : {}), ...(action.text_id ? { text: task.texts[action.text_id] } : {}) };
       lastAction = action.id; pending = true; stats.action_count++;
       const receipt = await session.call(action.op, args);
+      receiptObservation = receipt._receiptObservation;
       if (receipt.sent !== true) throw new Error('unknown_outcome');
       pending = false; history.push(action.id);
     }

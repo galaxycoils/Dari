@@ -3,8 +3,10 @@ mod ax;
 mod configuration;
 mod gesture;
 mod installation;
+mod legacy;
 mod pasteboard;
 mod stream;
+mod worker;
 
 use gesture::{Drag, Pinch, pinch_contacts};
 use idevice::{
@@ -58,6 +60,7 @@ impl Keyboard {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     DisplayInfo,
+    Screenshot,
     ListApps,
     InstallApp {
         ipa_path: String,
@@ -239,6 +242,12 @@ impl Request {
 async fn main() {
     let result = async {
         let args: Vec<String> = std::env::args().collect();
+        if args.len() == 4 && args[1] == "--udid" && args[3] == "--worker" {
+            worker::run(&args[2]).await?;
+            // Tokio stdin uses a blocking reader which can otherwise keep runtime
+            // shutdown waiting for EOF after SIGTERM. All session cleanup is done.
+            std::process::exit(0);
+        }
         if args.len() != 3 || args[1] != "--udid" {
             return Err("usage: poki-native --udid ID < request.json".into());
         }
@@ -253,7 +262,11 @@ async fn main() {
         } else {
             90
         };
-        tokio::time::timeout(Duration::from_secs(limit), execute(&args[2], request)).await?
+        tokio::time::timeout(
+            Duration::from_secs(limit),
+            legacy::execute(&args[2], request),
+        )
+        .await?
     }
     .await;
     match result {
@@ -285,7 +298,55 @@ async fn connect_device(
     Ok((adapter, rsd, provider))
 }
 
-async fn execute(udid: &str, request: Request) -> Result<Value> {
+struct DeviceSession {
+    connection: Option<(
+        idevice::tcp::handle::AdapterHandle,
+        RsdHandshake,
+        idevice::provider::UsbmuxdProvider,
+    )>,
+    media: Option<stream::ScreenMediaStream>,
+    touch: Option<Touch>,
+    keyboard: Option<Keyboard>,
+}
+impl DeviceSession {
+    fn new() -> Self {
+        Self {
+            connection: None,
+            media: None,
+            touch: None,
+            keyboard: None,
+        }
+    }
+    async fn close(&mut self) {
+        if let Some(mut keyboard) = self.keyboard.take() {
+            let _ = tokio::time::timeout(Duration::from_millis(250), async {
+                let _ = keyboard
+                    .hid
+                    .set_main_keyboard_usages(&mut keyboard.service, [])
+                    .await;
+                let _ = keyboard.close().await;
+            })
+            .await;
+        }
+        if let Some(mut touch) = self.touch.take() {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(250),
+                touch.send_touchscreen(TOUCHSCREEN_STATE_RELEASE, 0, 0, None),
+            )
+            .await;
+        }
+        if let Some(mut media) = self.media.take() {
+            let _ = media.client.stop_media_stream().await;
+        }
+        self.connection = None;
+    }
+}
+
+async fn execute_session(
+    udid: &str,
+    request: Request,
+    session: &mut DeviceSession,
+) -> Result<Value> {
     if matches!(
         request,
         Request::InstallApp { .. } | Request::UninstallApp { .. }
@@ -319,42 +380,62 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
             |error| json!({"isError":true,"outcome":"not_sent","error":error.to_string()}),
         ));
     }
-    if let Request::LaunchApp(request) = request {
-        let result = async {
-            let (mut adapter, mut rsd, _provider) = connect_device(udid).await?;
-            apps::launch(&mut adapter, &mut rsd, request).await
+    if session.connection.is_none() {
+        match connect_device(udid).await {
+            Ok(connection) => session.connection = Some(connection),
+            Err(error) if matches!(&request, Request::LaunchApp(_)) => {
+                return Ok(apps::not_sent(error));
+            }
+            Err(error) => return Err(error),
         }
-        .await;
-        return Ok(result.unwrap_or_else(apps::not_sent));
     }
-    let (mut adapter, mut rsd, provider) = connect_device(udid).await?;
+    let (adapter, rsd, provider) = session.connection.as_mut().unwrap();
+    if let Request::LaunchApp(request) = request {
+        return Ok(apps::launch(adapter, rsd, request)
+            .await
+            .unwrap_or_else(apps::not_sent));
+    }
+    if matches!(request, Request::Screenshot) {
+        use base64::Engine;
+        let mut remote =
+            idevice::dvt::remote_server::RemoteServerClient::connect_rsd(adapter, rsd).await?;
+        remote.read_message(0).await?;
+        let mut client = idevice::dvt::screenshot::ScreenshotClient::new(&mut remote).await?;
+        let image = client.take_screenshot().await?;
+        return Ok(json!({"png_base64":base64::engine::general_purpose::STANDARD.encode(image)}));
+    }
     if matches!(request, Request::ListApps) {
-        return apps::list(&mut adapter, &mut rsd, &provider).await;
+        return apps::list(adapter, rsd, provider).await;
     }
     if let Request::Configuration { method, value } = request {
-        return configuration::execute(&mut adapter, &mut rsd, &method, value).await;
+        return configuration::execute(adapter, rsd, &method, value).await;
     }
     if let Request::AxTree { include_offscreen } = request {
-        return ax::read_tree(&mut adapter, &rsd, include_offscreen).await;
+        return ax::read_tree(adapter, rsd, include_offscreen).await;
     }
     if matches!(request, Request::DisplayInfo) {
         let mut display =
-            idevice::core_device::DisplayServiceClient::connect_rsd(&mut adapter, &mut rsd).await?;
+            idevice::core_device::DisplayServiceClient::connect_rsd(adapter, rsd).await?;
         let info = display.get_media_support_info().await?;
         return Ok(serde_json::to_value(info)?);
     }
-    let mut media = stream::start_screen_media_stream(&mut adapter, &mut rsd, 1)
-        .await
-        .map_err(|e| format!("Cannot establish input media session: {e}"))?;
-    trace("media ready");
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    if session.media.is_none() {
+        session.media = Some(
+            stream::start_screen_media_stream(adapter, rsd, 1)
+                .await
+                .map_err(|e| format!("Cannot establish input media session: {e}"))?,
+        );
+        trace("media ready");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+    }
     // The device sometimes drops a touch whose connection closes straight after its last report, with no
     // error. The touch connection therefore stays open through the wait that follows the action;
     // NATIVE.md has the counts.
-    let mut touch: Option<Touch> = None;
+    let touch = &mut session.touch;
     let action: Result<Value> = async {
         match request {
             Request::DisplayInfo
+            | Request::Screenshot
             | Request::ListApps
             | Request::InstallApp { .. }
             | Request::UninstallApp { .. }
@@ -364,11 +445,11 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
                 unreachable!()
             }
             Request::Tap { x, y, duration_ms } | Request::LongPress { x, y, duration_ms } => {
-                let hid = touch.insert(Touch::connect_rsd(&mut adapter, &mut rsd).await?);
+                let hid = touch.insert(Touch::connect_rsd(adapter, rsd).await?);
                 held_tap(hid, x, y, duration_ms).await?;
             }
             Request::DoubleTap { x, y, duration_ms } => {
-                let hid = touch.insert(Touch::connect_rsd(&mut adapter, &mut rsd).await?);
+                let hid = touch.insert(Touch::connect_rsd(adapter, rsd).await?);
                 held_tap(hid, x, y, duration_ms).await?;
                 tokio::time::sleep(Duration::from_millis(80)).await;
                 held_tap(hid, x, y, duration_ms).await?;
@@ -382,7 +463,7 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
                 hold_ms,
                 end_hold_ms,
             } => {
-                let hid = touch.insert(Touch::connect_rsd(&mut adapter, &mut rsd).await?);
+                let hid = touch.insert(Touch::connect_rsd(adapter, rsd).await?);
                 Drag {
                     x1,
                     y1,
@@ -403,7 +484,7 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
                 angle,
                 duration_ms,
             } => {
-                let hid = touch.insert(Touch::connect_rsd(&mut adapter, &mut rsd).await?);
+                let hid = touch.insert(Touch::connect_rsd(adapter, rsd).await?);
                 Pinch {
                     x,
                     y,
@@ -420,19 +501,21 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
                 modifiers,
                 count,
             } => {
-                let mut keyboard = Keyboard::connect(&mut adapter, &mut rsd).await?;
+                session.keyboard = Some(Keyboard::connect(adapter, rsd).await?);
+                let keyboard = session.keyboard.as_mut().unwrap();
                 let usages = modifiers
                     .iter()
                     .map(|m| modifier_usage(m))
                     .collect::<Result<Vec<_>>>()?;
                 let outcome: Result<()> = async {
                     for _ in 0..count {
-                        chord(&mut keyboard, key_usage(&key)?, &usages).await?;
+                        chord(keyboard, key_usage(&key)?, &usages).await?;
                     }
                     Ok(())
                 }
                 .await;
                 let cleanup = keyboard.close().await;
+                session.keyboard = None;
                 outcome?;
                 cleanup?;
             }
@@ -441,7 +524,7 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
                 count,
                 interval_ms,
             } => {
-                let mut keyboard = Indigo::connect_rsd(&mut adapter, &mut rsd).await?;
+                let mut keyboard = Indigo::connect_rsd(adapter, rsd).await?;
                 let (code, duration) = button_usage(&button)?;
                 for index in 0..count {
                     if index > 0 {
@@ -458,11 +541,12 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
                 submit,
                 target,
             } => {
-                let mut keyboard = Keyboard::connect(&mut adapter, &mut rsd).await?;
+                session.keyboard = Some(Keyboard::connect(adapter, rsd).await?);
+                let keyboard = session.keyboard.as_mut().unwrap();
                 let outcome = pasteboard::paste_text(
-                    &mut adapter,
-                    &rsd,
-                    &mut keyboard,
+                    adapter,
+                    rsd,
+                    keyboard,
                     &text,
                     clear,
                     submit,
@@ -470,6 +554,7 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
                 )
                 .await;
                 let cleanup = keyboard.close().await;
+                session.keyboard = None;
                 let result = outcome?;
                 cleanup?;
                 return Ok(result);
@@ -479,13 +564,12 @@ async fn execute(udid: &str, request: Request) -> Result<Value> {
     }
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    drop(touch);
-    let stop = media.client.stop_media_stream().await;
-    drop(media.audio_udp);
-    drop(media.video_udp);
-    let output = action?;
-    stop?;
-    Ok(output)
+    if action.is_err() {
+        session.close().await;
+    } else {
+        session.touch = None;
+    }
+    action
 }
 
 async fn held_tap(hid: &mut Touch, x: u16, y: u16, ms: u64) -> Result<()> {

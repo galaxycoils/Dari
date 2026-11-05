@@ -1,5 +1,6 @@
 // Source: poki-app gateway/fast/session.mjs at 9972d34.
 // Source: poki-mcp/client/fast/session.mjs. App owns the MCP connection and cancellation.
+import { validReceiptObservation } from '../../src/observation-receipt.mjs';
 export class FastSession {
   constructor(call, stats, signal) {
     this.invoke = call;
@@ -16,7 +17,8 @@ export class FastSession {
       if (blocks.length !== 1) throw new Error('tool_protocol');
       const value = JSON.parse(blocks[0].text);
       if (!value || typeof value !== 'object' || value.isError || value.stopped && name !== 'release_device' || value.outcome === 'unknown') throw new Error('unknown_outcome');
-      return value;
+      const observed = validReceiptObservation(result, args.device);
+      return observed ? { ...value, _receiptObservation: observed } : value;
     } finally {
       this.stats.tool_calls++;
       const elapsed = performance.now() - started;

@@ -1,0 +1,28 @@
+name: Protocol and native regression tests
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            agent/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci --no-audit --no-fund
+      - run: npm ci --prefix agent --no-audit --no-fund
+      - name: Fetch pinned native dependency
+        run: |
+          git init .deps/idevice
+          git -C .deps/idevice remote add origin https://github.com/jkcoxson/idevice.git
+          git -C .deps/idevice fetch --depth=1 origin 89702099f4d7552f704f93b4526756abda319ceb
+          git -C .deps/idevice checkout --detach FETCH_HEAD
+      - run: cargo test --locked --manifest-path native/bridge/Cargo.toml
+      - run: cargo build --locked --manifest-path native/bridge/Cargo.toml
+      - run: npm test
+      - run: npm test --prefix agent

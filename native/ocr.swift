@@ -2,8 +2,11 @@ import Foundation
 import Vision
 import ImageIO
 
-guard CommandLine.arguments.count == 2,
-      let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: CommandLine.arguments[1]) as CFURL, nil),
+let source: CGImageSource? = CommandLine.arguments.count != 2 ? nil :
+    CommandLine.arguments[1] == "-"
+    ? CGImageSourceCreateWithData(FileHandle.standardInput.readDataToEndOfFile() as CFData, nil)
+    : CGImageSourceCreateWithURL(URL(fileURLWithPath: CommandLine.arguments[1]) as CFURL, nil)
+guard let source = source,
       let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
     fputs("Expected a readable image path\n", stderr)
     exit(1)

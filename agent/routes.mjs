@@ -1,5 +1,5 @@
 // Source: poki-app gateway/routes.mjs at 9972d34.
-import { readFile, writeFile, mkdir, rename, readdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { matching, conditionsMatch, planSchema, selectorFor } from './fast/task.mjs';
@@ -222,6 +222,7 @@ function compile(trace) {
   return { steps, success, final: current };
 }
 
+const routeCache = new Map();
 export class RouteStore {
   constructor(directory) { this.directory = directory; }
   async find(prompt, context = '') {
@@ -229,7 +230,17 @@ export class RouteStore {
     try { names = await readdir(this.directory); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
     const routes = [];
     for (const name of names.filter(name => name.endsWith('.json'))) {
-      const route = JSON.parse(await readFile(join(this.directory, name), 'utf8'));
+      const path = join(this.directory, name);
+      const info = await stat(path, { bigint: true });
+      const signature = `${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`;
+      let cached = routeCache.get(path);
+      if (!cached || cached.signature !== signature) {
+        try { cached = { signature, route: JSON.parse(await readFile(path, 'utf8')) }; }
+        catch { continue; } // An incomplete/corrupt route cannot become executable.
+        if (routeCache.size >= 256) routeCache.delete(routeCache.keys().next().value);
+        routeCache.set(path, cached);
+      }
+      const route = cached.route;
       if (route.version !== 5 || !route.bundle_id) continue;
       if ((route.context ?? '') !== context) continue;
       if (route.plan.steps.some(({ action }) => action.op === 'fill' && !action.identifier && !action.element_id)) continue;

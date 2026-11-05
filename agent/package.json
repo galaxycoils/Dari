@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node cli.mjs",
-    "test": "node --test test/*.test.mjs",
+    "test": "cd .. && node --test --test-concurrency=1 agent/test/*.test.mjs",
     "messages": "node imessage.mjs",
     "telegram": "node telegram.mjs"
   },

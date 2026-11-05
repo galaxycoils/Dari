@@ -1,0 +1,28 @@
+Poki Optimized validation
+
+Base commit: 8e740128a272709504fd57fd638de4df1a048976
+Branch: optimize/core
+Platform tested: Linux x86_64, Node 24.22.1, Rust 1.99.1
+
+PASS: full device/protocol suite: 137/137 (includes compiled worker tests)
+PASS: latest image/worker/receipt focused suite: 20/20
+      Includes changes added after the full suite started; overlaps full suite.
+PASS: agent suite: 56 passed, 1 optional gateway test skipped
+PASS: Rust bridge unit tests: 13/13
+PASS: Rust bridge debug build
+PASS: benchmark p50/p95 aggregation smoke check
+PASS: repeat-image benchmark: 40 interleaved repetitions, synthetic lossless image
+      Processing p50: previous 28.67 ms, improved 1.21 ms; p95: 34.05 -> 1.73 ms
+      Excludes device capture, AX, OCR execution and model time.
+PASS: JavaScript syntax, packaging shell syntax, git diff whitespace checks
+
+Tests use synthetic device/model/channel services. No phone was operated and no
+messages were sent. Swift OCR, real Apple transports, signed physical fixture,
+macOS packaging, channel delivery and performance release gates remain unverified.
+No physical-device speedup is claimed. Execution mode defaults to legacy.
+
+Run instructions: docs/optimization.md
+Native packaging: bin/package-macos (requires Apple Silicon macOS + Xcode)
+Physical benchmark: bin/benchmark-physical.mjs --help
+Local image benchmark: node bin/benchmark-images.mjs
+Local benchmark evidence: docs/image-benchmark.json
